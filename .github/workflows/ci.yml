@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 单测 + 管道冒烟
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: install
+        run: |
+          python -m pip install -U pip pytest
+          python -m pip install pandas geopandas shapely pyproj fastapi uvicorn httpx
+
+      - name: unit tests
+        run: pytest tests -q
+
+      - name: pipeline smoke（生成样例数据后跑全量批次）
+        run: |
+          python -m hub.sampledata
+          python -m hub.pipeline --all
+          python - <<'PY'
+          import json, sqlite3, subprocess, sys
+          conn = sqlite3.connect("data/hub.sqlite3")
+          rows = dict(conn.execute("SELECT dataset, COUNT(*) FROM batch_log GROUP BY dataset").fetchall())
+          print("batches:", rows)
+          assert rows.get("parcels") == 2 and rows.get("cities") == 1 and rows.get("shops") == 1, rows
+          dwd = conn.execute("SELECT COUNT(*) FROM dwd_parcels").fetchone()[0]
+          assert dwd == 5, dwd          # 3 干净 + 2 增量
+          PY
+
+  eval:
+    name: 接入 agent-eval 评测（11 条）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install
+        run: |
+          python -m pip install -U pip
+          python -m pip install pandas geopandas shapely pyproj fastapi uvicorn httpx
+          git clone --depth 1 https://github.com/Whybeyou/agent-eval /tmp/agent-eval
+          python -m pip install /tmp/agent-eval
+
+      - name: run suite
+        env:
+          GIS_DATAHUB_HOME: ${{ github.workspace }}
+        run: |
+          python -m evalkit.cli run /tmp/agent-eval/suites/gis_datahub
+          python - <<'PY'
+          import json
+          recs = [json.loads(l) for l in open("runs/gis_datahub.jsonl", encoding="utf-8") if l.strip()]
+          passed = sum(1 for r in recs if r["rule_pass"])
+          rate = 100.0 * passed / len(recs)
+          print(f"cases={len(recs)} passed={passed} rate={rate:.1f}%")
+          for r in recs:
+              if not r["rule_pass"]:
+                  print("  FAIL", r["id"], r.get("rule_score"), [(c["check"], c["result"]) for c in r["checks"]])
+          assert len(recs) == 11, len(recs)
+          assert rate >= 90, f"通过率 {rate:.1f}% 低于 90%"
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-runs
+          path: runs/
+          if-no-files-found: warn

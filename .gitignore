@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+data/raw/
+data/hub.sqlite3
+data/hub.sqlite3-*
+runs/
